@@ -44,7 +44,7 @@ void TextureCache::InvalidateMemory(VAddr address, size_t size, bool from_comput
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::CpuModified;
         // Untrack image, so the range is unprotected and the guest can write freely.
-        UntrackImage(image, image_id);
+        UntrackImage(image_id);
     });
 }
 
@@ -54,13 +54,8 @@ void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
     boost::container::small_vector<ImageId, 16> deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
     for (const ImageId id : deleted_images) {
-        Image& image = slot_images[id];
-        if (True(image.flags & ImageFlagBits::Tracked)) {
-            UntrackImage(image, id);
-        }
         // TODO: Download image data back to host.
-        UnregisterImage(id);
-        DeleteImage(id);
+        FreeImage(id);
     }
 }
 
@@ -75,10 +70,7 @@ ImageId TextureCache::ResolveOverlap(const ImageInfo& image_info, ImageId cache_
             if (scheduler.CurrentTick() - tex_cache_image.tick_accessed_last >
                 NumFramesBeforeRemoval) {
 
-                tex_cache_image.flags |= ImageFlagBits::Deleted;
-                UntrackImage(tex_cache_image, cache_image_id);
-                scheduler.DeferOperation(
-                    [this, cache_image_id]() { UnregisterImage(cache_image_id); });
+                FreeImage(cache_image_id);
             }
             return merged_image_id;
         }
@@ -99,15 +91,8 @@ ImageId TextureCache::ResolveOverlap(const ImageInfo& image_info, ImageId cache_
     }
 
     // Right overlap, the image requested is a possible subresource of the image from cache.
-    // Should be handled by view. No additional actions needed, just sanity check.
     if (image_info.guest_address > tex_cache_image.info.guest_address) {
-        if (image_info.IsSliceOf(tex_cache_image.info)) {
-            UNREACHABLE();
-        }
-        if (image_info.IsMipOf(tex_cache_image.info)) {
-            UNREACHABLE();
-        }
-        return cache_image_id;
+        // Should be handled by view. No additional actions needed.
     } else {
         // Left overlap, the image from cache is a possible subresource of the image requested
         if (!merged_image_id) {
@@ -125,9 +110,7 @@ ImageId TextureCache::ResolveOverlap(const ImageInfo& image_info, ImageId cache_
             auto& merged_image = slot_images[merged_image_id];
             merged_image.CopyMip(tex_cache_image, image_info.resources.levels - 1);
 
-            tex_cache_image.flags |= ImageFlagBits::Deleted;
-            UntrackImage(tex_cache_image, cache_image_id);
-            scheduler.DeferOperation([this, cache_image_id]() { UnregisterImage(cache_image_id); });
+            FreeImage(cache_image_id);
         }
 
         if (tex_cache_image.info.IsSliceOf(image_info)) {
@@ -149,12 +132,9 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     src_image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits::eTransferRead);
     new_image.CopyImage(src_image);
 
-    src_image.flags |= ImageFlagBits::Deleted;
-    UntrackImage(src_image, image_id);
+    FreeImage(image_id);
 
-    scheduler.DeferOperation([this, image_id]() { UnregisterImage(image_id); });
-
-    TrackImage(new_image, new_image_id);
+    TrackImage(new_image_id);
     new_image.flags &= ~ImageFlagBits::CpuModified;
     return new_image_id;
 }
@@ -164,7 +144,7 @@ ImageId TextureCache::FindImage(const ImageInfo& info) {
         return NULL_IMAGE_VIEW_ID;
     }
 
-    std::unique_lock lock{m_page_table};
+    std::unique_lock lock{mutex};
     boost::container::small_vector<ImageId, 8> image_ids;
     ForEachImageInRegion(
         info.guest_address, info.guest_size_bytes, [&](ImageId image_id, Image& image) {
@@ -437,7 +417,8 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     });
 }
 
-void TextureCache::TrackImage(Image& image, ImageId image_id) {
+void TextureCache::TrackImage(ImageId image_id) {
+    auto& image = slot_images[image_id];    
     if (True(image.flags & ImageFlagBits::Tracked)) {
         return;
     }
@@ -445,7 +426,8 @@ void TextureCache::TrackImage(Image& image, ImageId image_id) {
     tracker.UpdatePagesCachedCount(image.cpu_addr, image.info.guest_size_bytes, 1);
 }
 
-void TextureCache::UntrackImage(Image& image, ImageId image_id) {
+void TextureCache::UntrackImage(ImageId image_id) {
+    auto& image = slot_images[image_id];    
     if (False(image.flags & ImageFlagBits::Tracked)) {
         return;
     }
@@ -457,6 +439,8 @@ void TextureCache::DeleteImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Tracked), "Image was not untracked");
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
+
+    image.flags |= ImageFlagBits::Deleted;
 
     // Remove any registered meta areas.
     const auto& meta_info = image.info.meta_info;
