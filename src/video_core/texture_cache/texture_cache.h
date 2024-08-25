@@ -67,6 +67,11 @@ public:
         RefreshImage(image, custom_scheduler);
         TrackImage(image, image_id);
     }
+    
+    [[nodiscard]] ImageId ResolveOverlap(const ImageInfo& info, ImageId cache_img_id,
+                                         ImageId merged_image_id);
+
+    [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
 
     /// Reuploads image contents.
     void RefreshImage(Image& image, Vulkan::Scheduler* custom_scheduler = nullptr);
